@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "target": "ES6",                    // Compile to ES6
+    "module": "CommonJS",                // Use CommonJS module system
+    "strict": true,                      // Enable strict mode
+    "esModuleInterop": true,             // Enable interoperability for CommonJS modules
+    "skipLibCheck": true,                // Skip type checking of declaration files
+    "forceConsistentCasingInFileNames": true, // Prevent case mismatches in file names
+    "outDir": "./dist"                   // Output compiled JavaScript to the "dist" folder
+  },
+  "include": ["server/**/*.ts"],             // Include all TypeScript files in the "src" folder
+  "exclude": ["node_modules"]             // Exclude node_modules
+}
