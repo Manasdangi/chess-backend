@@ -17,7 +17,7 @@ import cors from 'cors';
   
 
 const PORT = process.env.PORT || 3001;
-const FRONTEND_URL = 'http://localhost:5173';
+const FRONTEND_URL = "https://chess-gamma-five.vercel.app/" ;//||  'http://localhost:5173';
 
 // Setup express app
 const app = express();
