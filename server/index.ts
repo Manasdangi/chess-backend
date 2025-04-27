@@ -17,7 +17,9 @@ import cors from 'cors';
   
 
 const PORT = process.env.PORT || 3001;
-const FRONTEND_URL = "https://chess-gamma-five.vercel.app/" ;//||  'http://localhost:5173';
+const FRONTEND_URL = process.env.NODE_ENV === 'production' 
+  ? "https://chess-gamma-five.vercel.app" // production URL
+  : "http://localhost:5173"; // local dev URL
 
 // Setup express app
 const app = express();
