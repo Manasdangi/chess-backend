@@ -147,6 +147,16 @@ io.on('connection', socket => {
     );
   });
 
+  socket.on('resign', (roomId: string, email: string) => {
+    socket.to(roomId).emit('opponentResign', email);
+    console.log(`🤝 Player resigned in room ${roomId}`);
+  });
+
+  socket.on('onOpponentTimeout', (roomId: string, email: string) => {
+    socket.to(roomId).emit('opponentTimeout', email);
+    console.log(`🤝 Player timedout in room ${roomId}`)
+  });
+
   socket.on('disconnect', () => {
     console.log(`❌ Client disconnected: ${socket.id}`);
     socket.rooms.forEach(room => {
