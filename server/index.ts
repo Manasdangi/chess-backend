@@ -3,28 +3,25 @@ import { createServer } from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
 
- interface Move {
-    from: {
-      row: number;
-      col: number;
-    };
-    to: {
-      row: number;
-      col: number;
-    };
-    piece: number;
-  }
-  
+interface Move {
+  from: {
+    row: number;
+    col: number;
+  };
+  to: {
+    row: number;
+    col: number;
+  };
+  piece: number;
+}
 
 const PORT = process.env.PORT || 3001;
-const FRONTEND_URL = process.env.NODE_ENV === 'production' 
-  ? "https://chess-gamma-five.vercel.app" // production URL
-  : "http://localhost:5173"; // local dev URL
+const FRONTEND_URL =
+  process.env.NODE_ENV === 'production'
+    ? 'https://chess-gamma-five.vercel.app'
+    : 'http://localhost:5173';
 
-// Setup express app
 const app = express();
-
-// Create HTTP server from express app
 const server = createServer(app);
 
 // Express CORS
@@ -44,13 +41,14 @@ const io = new Server(server, {
   },
 });
 
-// Store active room IDs and their creators
+// Room tracking
 export const activeRooms = new Set<string>();
 const roomCreators = new Map<string, string>();
 const roomPlayerCount = new Map<string, number>();
 const roomPlayers = new Map<string, string[]>();
+const roomPlayersSocketId = new Map<string, string[]>();
 
-// Health check endpoint
+// Health check
 app.get('/health', (req: Request, res: Response) => {
   res.status(200).json({ status: 'healthy' });
 });
@@ -58,27 +56,31 @@ app.get('/health', (req: Request, res: Response) => {
 io.on('connection', socket => {
   console.log(`🔌 Client connected: ${socket.id}`);
 
-  //
   socket.on('checkRoom', (roomId: string, callback: (exists: boolean) => void) => {
     const exists = activeRooms.has(roomId);
-    if (!exists) {
-      console.log('room does not exist');
-      callback(false);
-    } else {
-      console.log('room exists');
-      callback(true);
-    }
+    callback(exists);
   });
 
-  // Join a room
   socket.on('joinRoom', (roomId: string, userId: string) => {
-    console.log('joinRoom', roomId, userId);
+    console.log('joinRoom', roomId, socket.id, userId);
 
     const currentCount = roomPlayerCount.get(roomId) || 0;
     const currentPlayers = roomPlayers.get(roomId) || [];
-    console.log('currentCount', currentCount);
 
-    // Handle room full case
+    // Already in room
+    console.log('currentPlayers1', currentPlayers);
+    if (currentPlayers.includes(userId)) {
+      console.log('already in room');
+      socket.emit('alreadyInRoom', {
+        message: 'You are already in this room',
+        isCreator: currentPlayers[0] === userId,
+        playerCount: currentCount,
+        userId: socket.id,
+      });
+      return;
+    }
+
+    // Room full
     if (currentCount > 2) {
       console.log('room is full');
       socket.emit('roomFull', {
@@ -88,29 +90,19 @@ io.on('connection', socket => {
       return;
     }
 
-    // Handle already in room case
-    if (currentPlayers.includes(socket.id)) {
-      socket.emit('alreadyInRoom', {
-        message: 'You are already in this room',
-        isCreator: currentPlayers[0] === socket.id,
-        playerCount: currentCount,
-        userId: socket.id,
-      });
-      return;
-    }
-
     socket.join(roomId);
-    roomPlayers.set(roomId, [...currentPlayers, socket.id]);
+    roomPlayers.set(roomId, [...currentPlayers, userId]);
+    roomPlayersSocketId.set(roomId, [...(roomPlayersSocketId.get(roomId) || []), socket.id]);
+    console.log('currentPlayers2', roomPlayers.get(roomId));
     const newCount = currentCount + 1;
     roomPlayerCount.set(roomId, newCount);
 
     const isCreator = newCount === 1;
     if (isCreator) {
-      roomCreators.set(roomId, socket.id);
+      roomCreators.set(roomId, userId);
       activeRooms.add(roomId);
     }
 
-    // Notify the joining player
     socket.emit('roomJoined', {
       message: isCreator ? 'Room created successfully!' : 'Joined room successfully!',
       isCreator,
@@ -118,10 +110,11 @@ io.on('connection', socket => {
       userId: socket.id,
     });
 
-    // If second player joined, notify the first player
+
     if (newCount === 2) {
-      const firstPlayerId = currentPlayers[0];
+      const firstPlayerId = roomPlayersSocketId.get(roomId)?.[0];
       if (firstPlayerId) {
+        console.log('both players joined');
         io.to(firstPlayerId).emit('opponentJoined', {
           message: 'Your opponent has joined the room!',
           playerCount: newCount,
@@ -140,7 +133,6 @@ io.on('connection', socket => {
     socket.to(roomId).emit('newOpponentScore', score, color);
   });
 
-  // Handle moves and send to opponent
   socket.on('move', ({ roomId, move }: { roomId: string; move: Move }) => {
     socket.to(roomId).emit('opponentMove', move);
     console.log(
@@ -155,7 +147,7 @@ io.on('connection', socket => {
 
   socket.on('onOpponentTimeout', (roomId: string, email: string) => {
     socket.to(roomId).emit('opponentTimeout', email);
-    console.log(`🤝 Player timedout in room ${roomId}`)
+    console.log(`⏱️ Player timed out in room ${roomId}`);
   });
 
   socket.on('disconnect', () => {
@@ -175,7 +167,7 @@ io.on('connection', socket => {
   });
 });
 
-// Start the server
+// Start server
 server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
