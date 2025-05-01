@@ -71,15 +71,16 @@ io.on('connection', socket => {
   });
 
   // Join a room
-  socket.on('joinRoom', (roomId: string) => {
-    console.log('joinRoom', roomId);
+  socket.on('joinRoom', (roomId: string, userId: string) => {
+    console.log('joinRoom', roomId, userId);
 
     const currentCount = roomPlayerCount.get(roomId) || 0;
     const currentPlayers = roomPlayers.get(roomId) || [];
     console.log('currentCount', currentCount);
 
     // Handle room full case
-    if (currentCount >= 2) {
+    if (currentCount > 2) {
+      console.log('room is full');
       socket.emit('roomFull', {
         message: 'Room is full. Maximum 2 players allowed.',
         userId: socket.id,
