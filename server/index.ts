@@ -150,6 +150,11 @@ io.on('connection', socket => {
     console.log(`⏱️ Player timed out in room ${roomId}`);
   });
 
+  socket.on('onOpponentKingKilled', (roomId: string, email: string) => {
+    socket.to(roomId).emit('opponentKingKilled', email);
+    console.log(`💬 Message in room ${roomId}: ${email}`)  
+  });
+
   socket.on('disconnect', () => {
     console.log(`❌ Client disconnected: ${socket.id}`);
     socket.rooms.forEach(room => {
