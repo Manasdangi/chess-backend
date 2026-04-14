@@ -16,10 +16,20 @@ interface Move {
 }
 
 const PORT = process.env.PORT || 3001;
-const FRONTEND_URL =
-  process.env.NODE_ENV === 'production'
+
+function resolveCorsOrigin(): string | string[] {
+  const fromEnv = process.env.CORS_ORIGINS?.split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+  if (fromEnv?.length) {
+    return fromEnv.length === 1 ? fromEnv[0]! : fromEnv;
+  }
+  return process.env.NODE_ENV === 'production'
     ? 'https://chess-gamma-five.vercel.app'
     : 'http://localhost:5173';
+}
+
+const corsOrigin = resolveCorsOrigin();
 
 const app = express();
 const server = createServer(app);
@@ -27,7 +37,7 @@ const server = createServer(app);
 // Express CORS
 app.use(
   cors({
-    origin: FRONTEND_URL,
+    origin: corsOrigin,
     credentials: true,
   })
 );
@@ -35,7 +45,7 @@ app.use(
 // Socket.IO CORS
 const io = new Server(server, {
   cors: {
-    origin: FRONTEND_URL,
+    origin: corsOrigin,
     methods: ['GET', 'POST'],
     credentials: true,
   },
@@ -47,6 +57,9 @@ const roomCreators = new Map<string, string>();
 const roomPlayerCount = new Map<string, number>();
 const roomPlayers = new Map<string, string[]>();
 const roomPlayersSocketId = new Map<string, string[]>();
+const roomPlayerProfiles = new Map<string, { email: string; displayName: string }[]>();
+
+type JoinProfile = { email: string; displayName?: string };
 
 // Health check
 app.get('/health', (req: Request, res: Response) => {
@@ -61,7 +74,14 @@ io.on('connection', socket => {
     callback(exists);
   });
 
-  socket.on('joinRoom', (roomId: string, userId: string) => {
+  socket.on('joinRoom', (roomId: string, profileOrEmail: string | JoinProfile) => {
+    const profile: JoinProfile =
+      typeof profileOrEmail === 'string'
+        ? { email: profileOrEmail, displayName: '' }
+        : profileOrEmail;
+    const userId = profile.email;
+    const displayName = profile.displayName?.trim() ?? '';
+
     console.log('joinRoom', roomId, socket.id, userId);
 
     const currentCount = roomPlayerCount.get(roomId) || 0;
@@ -80,8 +100,8 @@ io.on('connection', socket => {
       return;
     }
 
-    // Room full
-    if (currentCount > 2) {
+    // Room full (two players already present)
+    if (currentCount >= 2) {
       console.log('room is full');
       socket.emit('roomFull', {
         message: 'Room is full. Maximum 2 players allowed.',
@@ -93,6 +113,10 @@ io.on('connection', socket => {
     socket.join(roomId);
     roomPlayers.set(roomId, [...currentPlayers, userId]);
     roomPlayersSocketId.set(roomId, [...(roomPlayersSocketId.get(roomId) || []), socket.id]);
+    roomPlayerProfiles.set(roomId, [
+      ...(roomPlayerProfiles.get(roomId) || []),
+      { email: userId, displayName },
+    ]);
     console.log('currentPlayers2', roomPlayers.get(roomId));
     const newCount = currentCount + 1;
     roomPlayerCount.set(roomId, newCount);
@@ -110,15 +134,18 @@ io.on('connection', socket => {
       userId: socket.id,
     });
 
-
     if (newCount === 2) {
-      const firstPlayerId = roomPlayersSocketId.get(roomId)?.[0];
-      if (firstPlayerId) {
+      const sockets = roomPlayersSocketId.get(roomId) || [];
+      const profiles = roomPlayerProfiles.get(roomId) || [];
+      if (sockets.length === 2 && profiles.length === 2) {
         console.log('both players joined');
-        io.to(firstPlayerId).emit('opponentJoined', {
-          message: 'Your opponent has joined the room!',
-          playerCount: newCount,
-          userId: firstPlayerId,
+        io.to(sockets[0]!).emit('opponentJoined', {
+          opponentEmail: profiles[1]!.email,
+          opponentDisplayName: profiles[1]!.displayName,
+        });
+        io.to(sockets[1]!).emit('opponentJoined', {
+          opponentEmail: profiles[0]!.email,
+          opponentDisplayName: profiles[0]!.displayName,
         });
       }
     }
@@ -166,6 +193,8 @@ io.on('connection', socket => {
           roomCreators.delete(room);
           roomPlayerCount.delete(room);
           roomPlayers.delete(room);
+          roomPlayersSocketId.delete(room);
+          roomPlayerProfiles.delete(room);
         }
       }
     });
