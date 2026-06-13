@@ -78,9 +78,9 @@ io.on('connection', socket => {
     const profile: JoinProfile =
       typeof profileOrEmail === 'string'
         ? { email: profileOrEmail, displayName: '' }
-        : profileOrEmail;
-    const userId = profile.email;
-    const displayName = profile.displayName?.trim() ?? '';
+        : profileOrEmail || { email: '', displayName: '' };
+    const userId = profile.email?.trim() || socket.id;
+    const displayName = profile.displayName?.trim() || 'Guest Player';
 
     console.log('joinRoom', roomId, socket.id, userId);
 
@@ -186,8 +186,17 @@ io.on('connection', socket => {
     console.log(`❌ Client disconnected: ${socket.id}`);
     socket.rooms.forEach(room => {
       if (room !== socket.id) {
-        const count = (roomPlayerCount.get(room) || 1) - 1;
-        roomPlayerCount.set(room, count);
+        const sockets = roomPlayersSocketId.get(room) || [];
+        const leavingPlayerIndex = sockets.indexOf(socket.id);
+        const nextSockets = sockets.filter(id => id !== socket.id);
+        const nextPlayers = (roomPlayers.get(room) || []).filter(
+          (_, index) => index !== leavingPlayerIndex
+        );
+        const nextProfiles = (roomPlayerProfiles.get(room) || []).filter(
+          (_, index) => index !== leavingPlayerIndex
+        );
+        const count = nextSockets.length;
+
         if (count === 0) {
           activeRooms.delete(room);
           roomCreators.delete(room);
@@ -195,6 +204,11 @@ io.on('connection', socket => {
           roomPlayers.delete(room);
           roomPlayersSocketId.delete(room);
           roomPlayerProfiles.delete(room);
+        } else {
+          roomPlayerCount.set(room, count);
+          roomPlayers.set(room, nextPlayers);
+          roomPlayersSocketId.set(room, nextSockets);
+          roomPlayerProfiles.set(room, nextProfiles);
         }
       }
     });
