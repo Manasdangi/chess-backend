@@ -2,20 +2,64 @@ import express, { Request, Response } from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
+import { Chess, type Move as ChessMove, type Square } from 'chess.js';
 
 interface Move {
-  from: {
-    row: number;
-    col: number;
-  };
-  to: {
-    row: number;
-    col: number;
-  };
-  piece: number;
+  from: Square;
+  to: Square;
+  promotion?: 'q' | 'r' | 'b' | 'n';
+  san?: string;
+  lan?: string;
+  fen?: string;
+}
+
+interface ClockState {
+  whiteTime: number;
+  blackTime: number;
+}
+
+interface CaptureState {
+  whiteScore: number[];
+  blackScore: number[];
+}
+
+interface GameStatus {
+  isCheck: boolean;
+  isCheckmate: boolean;
+  isDraw: boolean;
+  isGameOver: boolean;
+  winner: 'white' | 'black' | 'draw' | null;
+  endReason?: string;
+}
+
+interface ServerMovePayload extends ClockState, CaptureState {
+  fen: string;
+  move: Move;
+  status: GameStatus;
+}
+
+interface RoomGame {
+  game: Chess;
+  whiteTime: number;
+  blackTime: number;
+  lastTickAt: number;
+  timer: ReturnType<typeof setInterval> | null;
+  socketColors: Map<string, 'white' | 'black'>;
+  whiteScore: number[];
+  blackScore: number[];
+  over: boolean;
 }
 
 const PORT = process.env.PORT || 3001;
+const GAME_SECONDS = 10 * 60;
+const PIECE_TO_CODE = {
+  k: 1,
+  q: 2,
+  b: 3,
+  n: 4,
+  r: 5,
+  p: 6,
+} as const;
 
 function resolveCorsOrigin(): string | string[] {
   const fromEnv = process.env.CORS_ORIGINS?.split(',')
@@ -26,7 +70,16 @@ function resolveCorsOrigin(): string | string[] {
   }
   return process.env.NODE_ENV === 'production'
     ? 'https://chess-gamma-five.vercel.app'
-    : 'http://localhost:5173';
+    : [
+        'http://localhost:5173',
+        'http://localhost:5174',
+        'http://localhost:5175',
+        'http://localhost:5176',
+        'http://127.0.0.1:5173',
+        'http://127.0.0.1:5174',
+        'http://127.0.0.1:5175',
+        'http://127.0.0.1:5176',
+      ];
 }
 
 const corsOrigin = resolveCorsOrigin();
@@ -58,8 +111,174 @@ const roomPlayerCount = new Map<string, number>();
 const roomPlayers = new Map<string, string[]>();
 const roomPlayersSocketId = new Map<string, string[]>();
 const roomPlayerProfiles = new Map<string, { email: string; displayName: string }[]>();
+const roomGames = new Map<string, RoomGame>();
 
 type JoinProfile = { email: string; displayName?: string };
+
+function oppositeColor(color: 'white' | 'black') {
+  return color === 'white' ? 'black' : 'white';
+}
+
+function turnName(game: Chess): 'white' | 'black' {
+  return game.turn() === 'w' ? 'white' : 'black';
+}
+
+function getRoomGame(roomId: string): RoomGame {
+  const existing = roomGames.get(roomId);
+  if (existing) return existing;
+  const next: RoomGame = {
+    game: new Chess(),
+    whiteTime: GAME_SECONDS,
+    blackTime: GAME_SECONDS,
+    lastTickAt: Date.now(),
+    timer: null,
+    socketColors: new Map(),
+    whiteScore: [],
+    blackScore: [],
+    over: false,
+  };
+  roomGames.set(roomId, next);
+  return next;
+}
+
+function stopRoomTimer(roomId: string) {
+  const roomGame = roomGames.get(roomId);
+  if (!roomGame?.timer) return;
+  clearInterval(roomGame.timer);
+  roomGame.timer = null;
+}
+
+function statusForGame(game: Chess, endReason?: string): GameStatus {
+  const isCheckmate = game.isCheckmate();
+  const isDraw = game.isDraw();
+  const isGameOver = game.isGameOver();
+  const winner = isCheckmate ? oppositeColor(turnName(game)) : isDraw ? 'draw' : null;
+
+  let resolvedReason = endReason;
+  if (!resolvedReason && isCheckmate) resolvedReason = 'checkmate';
+  if (!resolvedReason && game.isStalemate()) resolvedReason = 'stalemate';
+  if (!resolvedReason && game.isThreefoldRepetition()) resolvedReason = 'threefold_repetition';
+  if (!resolvedReason && game.isInsufficientMaterial()) resolvedReason = 'insufficient_material';
+  if (!resolvedReason && game.isDrawByFiftyMoves()) resolvedReason = 'fifty_move_rule';
+  if (!resolvedReason && isDraw) resolvedReason = 'draw';
+
+  return {
+    isCheck: game.isCheck(),
+    isCheckmate,
+    isDraw,
+    isGameOver,
+    winner,
+    endReason: resolvedReason,
+  };
+}
+
+function gameOverPayload(
+  roomGame: RoomGame,
+  status: GameStatus,
+  winner: 'white' | 'black' | 'draw' | null = status.winner
+) {
+  return {
+    fen: roomGame.game.fen(),
+    whiteTime: roomGame.whiteTime,
+    blackTime: roomGame.blackTime,
+    whiteScore: roomGame.whiteScore,
+    blackScore: roomGame.blackScore,
+    ...status,
+    winner,
+  };
+}
+
+function movePayload(roomGame: RoomGame, move: ChessMove, status: GameStatus): ServerMovePayload {
+  return {
+    fen: roomGame.game.fen(),
+    whiteTime: roomGame.whiteTime,
+    blackTime: roomGame.blackTime,
+    whiteScore: roomGame.whiteScore,
+    blackScore: roomGame.blackScore,
+    move: {
+      from: move.from,
+      to: move.to,
+      promotion: move.promotion as Move['promotion'],
+      san: move.san,
+      lan: move.lan,
+      fen: roomGame.game.fen(),
+    },
+    status,
+  };
+}
+
+function trackCapture(roomGame: RoomGame, move: ChessMove) {
+  if (!move.captured) return;
+  const capturedColor = move.color === 'w' ? 'b' : 'w';
+  const capturedCode = PIECE_TO_CODE[move.captured] * (capturedColor === 'w' ? 1 : -1);
+  if (move.color === 'w') {
+    roomGame.whiteScore.push(capturedCode);
+  } else {
+    roomGame.blackScore.push(capturedCode);
+  }
+}
+
+function syncClock(roomId: string) {
+  const roomGame = roomGames.get(roomId);
+  if (!roomGame || roomGame.over) return null;
+
+  const now = Date.now();
+  const elapsed = Math.floor((now - roomGame.lastTickAt) / 1000);
+  if (elapsed < 1) return null;
+
+  if (turnName(roomGame.game) === 'white') {
+    roomGame.whiteTime = Math.max(0, roomGame.whiteTime - elapsed);
+  } else {
+    roomGame.blackTime = Math.max(0, roomGame.blackTime - elapsed);
+  }
+  roomGame.lastTickAt += elapsed * 1000;
+
+  if (roomGame.whiteTime === 0 || roomGame.blackTime === 0) {
+    roomGame.over = true;
+    stopRoomTimer(roomId);
+    const winner = roomGame.whiteTime === 0 ? 'black' : 'white';
+    const status: GameStatus = {
+      isCheck: roomGame.game.isCheck(),
+      isCheckmate: false,
+      isDraw: false,
+      isGameOver: true,
+      winner,
+      endReason: 'clock_timeout',
+    };
+    io.to(roomId).emit('gameOver', gameOverPayload(roomGame, status, winner));
+    return status;
+  }
+
+  io.to(roomId).emit('clockUpdate', {
+    whiteTime: roomGame.whiteTime,
+    blackTime: roomGame.blackTime,
+  });
+  return null;
+}
+
+function startRoomTimer(roomId: string) {
+  const roomGame = getRoomGame(roomId);
+  stopRoomTimer(roomId);
+  roomGame.lastTickAt = Date.now();
+  roomGame.timer = setInterval(() => syncClock(roomId), 1000);
+}
+
+function resetRoomGame(roomId: string) {
+  stopRoomTimer(roomId);
+  const roomGame: RoomGame = {
+    game: new Chess(),
+    whiteTime: GAME_SECONDS,
+    blackTime: GAME_SECONDS,
+    lastTickAt: Date.now(),
+    timer: null,
+    socketColors: new Map(),
+    whiteScore: [],
+    blackScore: [],
+    over: false,
+  };
+  roomGames.set(roomId, roomGame);
+  return roomGame;
+}
 
 // Health check
 app.get('/health', (req: Request, res: Response) => {
@@ -152,7 +371,31 @@ io.on('connection', socket => {
   });
 
   socket.on('choosePieceColor', (roomId: string, color: string) => {
+    if (color !== 'white' && color !== 'black') {
+      socket.emit('moveRejected', { message: 'Invalid color choice.' });
+      return;
+    }
+
+    const sockets = roomPlayersSocketId.get(roomId) || [];
+    if (sockets.length < 2) {
+      socket.emit('moveRejected', { message: 'Wait for the opponent before choosing a color.' });
+      return;
+    }
+    if (socket.id !== sockets[0]) {
+      socket.emit('moveRejected', { message: 'Only the room creator can choose a color.' });
+      return;
+    }
+
+    const roomGame = resetRoomGame(roomId);
+    roomGame.socketColors.set(sockets[0]!, color);
+    roomGame.socketColors.set(sockets[1]!, oppositeColor(color));
+
     socket.to(roomId).emit('opponentChoosePieceColor', color);
+    io.to(roomId).emit('clockUpdate', {
+      whiteTime: roomGame.whiteTime,
+      blackTime: roomGame.blackTime,
+    });
+    startRoomTimer(roomId);
   });
 
   socket.on('updateOpponentScore', (roomId: string, score: number[], color: string) => {
@@ -161,25 +404,80 @@ io.on('connection', socket => {
   });
 
   socket.on('move', ({ roomId, move }: { roomId: string; move: Move }) => {
-    socket.to(roomId).emit('opponentMove', move);
-    console.log(
-      `🎯 Move in ${roomId} by ${move.piece > 0 ? 'white' : 'black'}: ${move.from} → ${move.to}`
-    );
+    const roomGame = roomGames.get(roomId);
+    const playerColor = roomGame?.socketColors.get(socket.id);
+    if (!roomGame || !playerColor) {
+      socket.emit('moveRejected', { message: 'Game is not ready yet.' });
+      return;
+    }
+    if (roomGame.over) {
+      socket.emit('moveRejected', { message: 'This game is already over.' });
+      return;
+    }
+
+    syncClock(roomId);
+    if (roomGame.over) return;
+
+    if (playerColor !== turnName(roomGame.game)) {
+      socket.emit('moveRejected', { message: 'It is not your turn.' });
+      return;
+    }
+
+    let legalMove: ChessMove | null = null;
+    try {
+      legalMove = roomGame.game.move({
+        from: move.from,
+        to: move.to,
+        promotion: move.promotion || 'q',
+      });
+    } catch {
+      legalMove = null;
+    }
+
+    if (!legalMove) {
+      socket.emit('moveRejected', { message: 'Illegal move rejected by server.' });
+      return;
+    }
+
+    roomGame.lastTickAt = Date.now();
+    trackCapture(roomGame, legalMove);
+    const status = statusForGame(roomGame.game);
+    if (status.isGameOver) {
+      roomGame.over = true;
+      stopRoomTimer(roomId);
+    }
+
+    const payload = movePayload(roomGame, legalMove, status);
+    socket.emit('moveAccepted', payload);
+    socket.to(roomId).emit('opponentMove', payload);
+    console.log(`🎯 Move in ${roomId}: ${legalMove.san}`);
   });
 
-  socket.on('resign', (roomId: string, email: string) => {
-    socket.to(roomId).emit('opponentResign', email);
+  socket.on('resign', (roomId: string) => {
+    const roomGame = getRoomGame(roomId);
+    const playerColor = roomGame.socketColors.get(socket.id);
+    roomGame.over = true;
+    stopRoomTimer(roomId);
+    const winner = playerColor ? oppositeColor(playerColor) : null;
+    const status: GameStatus = {
+      isCheck: roomGame.game.isCheck(),
+      isCheckmate: false,
+      isDraw: false,
+      isGameOver: true,
+      winner,
+      endReason: 'resigned',
+    };
+    io.to(roomId).emit('gameOver', gameOverPayload(roomGame, status, winner));
     console.log(`🤝 Player resigned in room ${roomId}`);
   });
 
-  socket.on('onOpponentTimeout', (roomId: string, email: string) => {
-    socket.to(roomId).emit('opponentTimeout', email);
+  socket.on('onOpponentTimeout', (roomId: string) => {
+    syncClock(roomId);
     console.log(`⏱️ Player timed out in room ${roomId}`);
   });
 
-  socket.on('onOpponentKingKilled', (roomId: string, email: string) => {
-    socket.to(roomId).emit('opponentKingKilled', email);
-    console.log(`💬 Message in room ${roomId}: ${email}`)  
+  socket.on('onOpponentKingKilled', (roomId: string) => {
+    console.log(`💬 Legacy king capture event ignored in room ${roomId}`)  
   });
 
   socket.on('disconnect', () => {
@@ -198,12 +496,14 @@ io.on('connection', socket => {
         const count = nextSockets.length;
 
         if (count === 0) {
+          stopRoomTimer(room);
           activeRooms.delete(room);
           roomCreators.delete(room);
           roomPlayerCount.delete(room);
           roomPlayers.delete(room);
           roomPlayersSocketId.delete(room);
           roomPlayerProfiles.delete(room);
+          roomGames.delete(room);
         } else {
           roomPlayerCount.set(room, count);
           roomPlayers.set(room, nextPlayers);
