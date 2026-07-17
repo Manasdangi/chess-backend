@@ -1,5 +1,7 @@
 import express, { Request, Response } from 'express';
 import { createServer } from 'http';
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
 import { Server } from 'socket.io';
 import cors from 'cors';
 import { Chess, type Move as ChessMove, type Square } from 'chess.js';
@@ -50,8 +52,15 @@ interface RoomGame {
   over: boolean;
 }
 
+interface ViewerCountStore {
+  count: number;
+  viewerIds: string[];
+}
+
 const PORT = process.env.PORT || 3001;
 const GAME_SECONDS = 10 * 60;
+const VIEWER_COUNT_FILE =
+  process.env.VIEWER_COUNT_FILE || path.join(process.cwd(), 'data', 'viewer-count.json');
 const PIECE_TO_CODE = {
   k: 1,
   q: 2,
@@ -87,6 +96,8 @@ const corsOrigin = resolveCorsOrigin();
 const app = express();
 const server = createServer(app);
 
+app.use(express.json());
+
 // Express CORS
 app.use(
   cors({
@@ -112,8 +123,54 @@ const roomPlayers = new Map<string, string[]>();
 const roomPlayersSocketId = new Map<string, string[]>();
 const roomPlayerProfiles = new Map<string, { email: string; displayName: string }[]>();
 const roomGames = new Map<string, RoomGame>();
+let viewerStoreWriteQueue = Promise.resolve();
 
 type JoinProfile = { email: string; displayName?: string };
+
+function isViewerCountStore(value: unknown): value is ViewerCountStore {
+  if (!value || typeof value !== 'object') return false;
+  const data = value as Partial<ViewerCountStore>;
+  return typeof data.count === 'number' && Array.isArray(data.viewerIds);
+}
+
+async function readViewerCountStore(): Promise<ViewerCountStore> {
+  try {
+    const file = await fs.readFile(VIEWER_COUNT_FILE, 'utf8');
+    const parsed: unknown = JSON.parse(file);
+    if (isViewerCountStore(parsed)) {
+      return {
+        count: Math.max(0, Math.floor(parsed.count)),
+        viewerIds: parsed.viewerIds.filter(id => typeof id === 'string'),
+      };
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      console.warn('Could not read viewer count store', error);
+    }
+  }
+
+  return { count: 0, viewerIds: [] };
+}
+
+async function writeViewerCountStore(store: ViewerCountStore) {
+  await fs.mkdir(path.dirname(VIEWER_COUNT_FILE), { recursive: true });
+  await fs.writeFile(VIEWER_COUNT_FILE, JSON.stringify(store, null, 2));
+}
+
+async function registerViewer(visitorId: string) {
+  viewerStoreWriteQueue = viewerStoreWriteQueue.then(async () => {
+    const store = await readViewerCountStore();
+    if (!store.viewerIds.includes(visitorId)) {
+      store.viewerIds.push(visitorId);
+      store.count = store.viewerIds.length;
+      await writeViewerCountStore(store);
+    }
+    return undefined;
+  });
+
+  await viewerStoreWriteQueue;
+  return readViewerCountStore();
+}
 
 function oppositeColor(color: 'white' | 'black') {
   return color === 'white' ? 'black' : 'white';
@@ -283,6 +340,22 @@ function resetRoomGame(roomId: string) {
 // Health check
 app.get('/health', (req: Request, res: Response) => {
   res.status(200).json({ status: 'healthy' });
+});
+
+app.get('/viewer-count', async (_req: Request, res: Response) => {
+  const store = await readViewerCountStore();
+  res.status(200).json({ count: store.count });
+});
+
+app.post('/viewer-count/register', async (req: Request, res: Response) => {
+  const visitorId = typeof req.body?.visitorId === 'string' ? req.body.visitorId.trim() : '';
+  if (!visitorId) {
+    res.status(400).json({ message: 'visitorId is required' });
+    return;
+  }
+
+  const store = await registerViewer(visitorId);
+  res.status(200).json({ count: store.count });
 });
 
 io.on('connection', socket => {
